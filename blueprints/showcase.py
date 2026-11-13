@@ -32,8 +32,13 @@ from . import audit_log, _current_user
 bp = Blueprint("showcase", __name__, url_prefix="/showcase")
 
 PROJECT_STATUS = ('idea', 'ongoing', 'done')
-SOURCE_TEXT = {'camp': '营期项目', 'community': '自由分享'}
+PROJECT_TRACKS = ('innovation', 'competition', 'lab', 'course', 'personal', 'other')
+SOURCE_TEXT = {'camp': '营期项目', 'community': '自由分享', 'project': '长期项目'}
 STATUS_TEXT = {'idea': '构思中', 'ongoing': '进行中', 'done': '已完成'}
+TRACK_TEXT = {
+    'innovation': '大创', 'competition': '比赛', 'lab': '实验室',
+    'course': '课程项目', 'personal': '个人探索', 'other': '其他',
+}
 GALLERY_MAX = 9          # 图集上限（单次+存量合计）
 IMG_EXTS = ("jpg", "jpeg", "png", "webp")
 IMG_MAX_BYTES = 10 * 1024 * 1024
@@ -73,10 +78,13 @@ def _p_dict(p, user=None, favorited=None, owner=None, fav_count=None):
         "id": p.id, "source": p.source, "source_text": SOURCE_TEXT.get(p.source, p.source),
         "source_ref": p.source_ref, "owner_user_id": p.owner_user_id,
         "owner_name": owner.username if owner else '',
+        "owner_avatar": owner.avatar_url if owner else None,
         "title": p.title, "summary": p.summary, "description": p.description,
         "cover": p.cover, "cover_thumb": _cover_thumb_url(p),
         "images": _gallery_list(p),
         "tags": json.loads(p.tags) if p.tags else [],
+        "track": p.track or 'other',
+        "track_text": TRACK_TEXT.get(p.track or 'other', '其他'),
         "project_status": p.project_status,
         "project_status_text": STATUS_TEXT.get(p.project_status, p.project_status),
         "status": p.status, "view_count": p.view_count,
@@ -91,7 +99,7 @@ def _p_dict(p, user=None, favorited=None, owner=None, fav_count=None):
     }
     if user is not None:
         out["favorited"] = bool(favorited)
-        out["can_manage"] = user.is_admin() or p.owner_user_id == user.id
+        out["can_manage"] = _can_manage(p,user)
     # camp 溯源：营期名 + 周期（列表路径由调用方批量补齐，见 project_list）
     if p.source == 'camp' and p.source_ref:
         unit = CampUnit.query.get(p.source_ref)
@@ -104,6 +112,11 @@ def _p_dict(p, user=None, favorited=None, owner=None, fav_count=None):
 
 
 def _can_manage(p, user):
+    if p.source=='project':
+        from models import Project
+        from services.projects.core import role
+        project=db.session.get(Project,p.source_ref)
+        return bool(project and role(project,user) in ('admin','leader'))
     return user.is_admin() or p.owner_user_id == user.id
 
 
@@ -268,10 +281,14 @@ def project_create():
     if members is not None and (not isinstance(members, list) or len(members) > 20
                                 or any(not isinstance(m, str) or len(m) > 30 for m in members)):
         return jsonify({"code": 400, "message": "members 须为 ≤20 个名字的数组"}), 400
+    track = d.get("track") or 'other'
+    if track not in PROJECT_TRACKS:
+        return jsonify({"code": 400, "message": "请选择有效的项目赛道"}), 400
     p = ShowcaseProject(
         source='community', owner_user_id=user.id, title=title,
         summary=(d.get("summary") or "").strip()[:300] or None,
         description=d.get("description"),
+        track=track,
         tags=json.dumps([t.strip() for t in tags if t.strip()], ensure_ascii=False) if tags else None,
         project_status=d.get("project_status") if d.get("project_status") in PROJECT_STATUS else 'ongoing',
         members_json=json.dumps(members, ensure_ascii=False) if members else None,
@@ -307,6 +324,10 @@ def project_update(pid):
         p.cover = d.get("cover")
     if d.get("tags") is not None and isinstance(d.get("tags"), list):
         p.tags = json.dumps([t.strip() for t in d["tags"] if t.strip()], ensure_ascii=False)
+    if "track" in d:
+        if d.get("track") not in PROJECT_TRACKS:
+            return jsonify({"code": 400, "message": "请选择有效的项目赛道"}), 400
+        p.track = d["track"]
     if d.get("project_status") in PROJECT_STATUS and p.source == 'community':
         p.project_status = d["project_status"]      # camp 条目状态随营期，手改仅 community
     if d.get("members") is not None and isinstance(d.get("members"), list):

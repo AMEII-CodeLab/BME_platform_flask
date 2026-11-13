@@ -46,8 +46,18 @@ from models import (ArticleModel, ArticleV2Model, CampChapterCertification,
                      FeedbackTicket, LearningProgressModel, LLMQuotaRequestModel,
                      LLMUserKeyModel, MedalUserModel, ShowcaseProject, TaskAssignee,
                      UserCourseModel, WorkAccessGrant, WorkFile, WorkItemParticipant)
+from models import GroupMembership, CampGroup, GroupRoleAssignment, GroupMembershipEvent, GroupOperation, CampTeachingEvent, TrainingGroupProfile, TrainingMigrationRun
 
 SHELL_MODULES = {
+    'training_migration_actor': (TrainingMigrationRun, 'actor_user_id'),
+    'training_event_subject': (CampTeachingEvent, 'user_id'),
+    'training_event_actor': (CampTeachingEvent, 'actor_user_id'),
+    'training_recruitment': (TrainingGroupProfile, 'recruitment_mentor_id'),
+    'group_member': (GroupMembership, 'user_id'),
+    'group_owner': (CampGroup, 'owner_user_id'),
+    'group_appointment': (GroupRoleAssignment, 'granted_by'),
+    'group_event': (GroupMembershipEvent, 'actor_user_id'),
+    'group_operation': (GroupOperation, 'actor_user_id'),
     'user_course': (UserCourseModel, 'user_id'),
     'learning_progress': (LearningProgressModel, 'user_id'),
     'camp_learning': (CampLearningProgress, 'user_id'),
@@ -249,6 +259,22 @@ def shell_scan(user_b):
         blockers.append('target_disputed')
 
     hits = {}
+    import os
+    if os.getenv('WORKBENCH_RETIRED', 'false').lower() == 'true':
+        try:
+            import requests
+            response = requests.post(os.environ['WORKBENCH_USAGE_URL'],
+                auth=(os.environ['WORKBENCH_CLIENT_ID'], os.environ['WORKBENCH_CLIENT_SECRET']),
+                json={'issuer':os.getenv('WORKBENCH_ISSUER','bme-training'),'subject':str(user_b.id),
+                      'person_id':str(user_b.person_id) if user_b.person_id else None},
+                timeout=(2,5),allow_redirects=False)
+            payload=response.json()
+            if response.status_code!=200 or type(payload.get('has_business_data')) is not bool:
+                raise ValueError('Invalid workbench scan response')
+            if payload['has_business_data']:
+                hits['independent_workbench']=1
+        except Exception:
+            blockers.append('scan_error:independent_workbench')
     for name, (model, col) in SHELL_MODULES.items():
         try:
             n = model.query.filter(getattr(model, col) == user_b.id).count()
@@ -478,6 +504,9 @@ def confirm_link(actor, case, *, preview_digest):
         if not hmac.compare_digest(digest_now, case.preview_digest):
             raise AuthRejected('目标账号数据已变化，需重新审核',
                                status=409, machine='STALE_PREVIEW')
+
+    from services.camp_groups.identity import prepare_person_rebind
+    prepare_person_rebind(user_b, person_a.id, user_a.id)
 
     # ── prepared → applied：一个事务内完成全部写（规格 3.4 顺序）──
     _transition(case, 'prepared', user_a.id, '确认执行')

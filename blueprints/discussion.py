@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from flask_cors import cross_origin
 from sqlalchemy import and_, or_
 from datetime import datetime, timedelta
@@ -13,8 +13,32 @@ from flask_jwt_extended import get_jwt_identity, jwt_required
 
 from storage import storage
 import imaging
+from services import community_reading as reading
 
 bp = Blueprint("discussion", __name__, url_prefix="/discussions")
+
+
+@bp.errorhandler(reading.CommunityError)
+def reading_error(error):
+    db.session.rollback()
+    response = jsonify(code=error.status, message=error.message, **error.extra)
+    if error.status == 429:
+        response.headers['Retry-After'] = str(error.extra.get('retry_after', 60))
+    return response, error.status
+
+
+@bp.route('/replies/<int:reply_id>/children', methods=['GET'])
+@jwt_required()
+def reply_children(reply_id):
+    root = db.session.get(DiscussionReply, reply_id)
+    user = get_current_user()
+    if not user:
+        return jsonify(code=401, message='用户不存在'), 401
+    if not root or root.parent_reply_id is not None or root.thread.scope_type != 'global':
+        return jsonify(code=404, message='评论不存在'), 404
+    if not can_view_thread(root.thread, user):
+        return jsonify(code=403, message='无权限查看'), 403
+    return jsonify(reading.list_comments(root.thread, request.args, user, root=root))
 
 # CORS 配置
 _cors_config = {
@@ -41,6 +65,10 @@ CATEGORY_TEXT = {'chat': '闲聊', 'ask': '提问', 'share': '分享', 'recruit'
 
 def _thread_images(thread):
     """帖子图集 URL 数组（json 列解析；旧帖无图为空数组）。"""
+    if thread.scope_type == 'global':
+        db.session.refresh(thread, with_for_update=True)
+        if reading.closed(thread):
+            return []
     try:
         return json.loads(thread.images_json) if thread.images_json else []
     except (TypeError, ValueError):
@@ -99,6 +127,7 @@ def _thread_extra(t, project_titles=None):
         "category_text": CATEGORY_TEXT.get(t.category) if t.category else None,
         "project_id": t.project_id,
         "project_title": title,
+        **(reading.thread_extra(t) if t.scope_type == 'global' else {}),
     }
 
 
@@ -298,6 +327,12 @@ def get_or_create_article_v2_thread(article_id):
     article = ArticleV2Model.query.get(article_id)
     if not article:
         return jsonify({"code": 404, "message": "文章不存在"}), 404
+    # 非公开文章（草稿/待审核）不提供评论区：仅作者本人与管理员可读，
+    # 且待审文章不创建公开评论区（先审后发 2026-10-15）
+    if article.status != ArticleV2Model.STATUS_PUBLISHED:
+        from .article_v2 import _is_article_manager
+        if not (_is_article_manager(user) or article.author_id == user.id):
+            return jsonify({"code": 404, "message": "文章不存在"}), 404
 
     thread = DiscussionThread.query.filter_by(
         scope_type='article_v2',
@@ -305,7 +340,7 @@ def get_or_create_article_v2_thread(article_id):
         status=DiscussionThread.STATUS_NORMAL
     ).order_by(DiscussionThread.created_at.asc()).first()
 
-    if not thread:
+    if not thread and article.status == ArticleV2Model.STATUS_PUBLISHED:
         thread = DiscussionThread(
             title=f"文章评论 · {article.title}",
             content="该文章的评论区（系统自动创建）",
@@ -340,10 +375,16 @@ def create_thread():
     if not data:
         return jsonify({"code": 400, "message": "请求参数错误"}), 400
 
+    if not isinstance(data, dict):
+        raise reading.CommunityError('请求参数错误')
     title = data.get('title')
     content = data.get('content')
     scope_type = data.get('scope_type', 'global')
     scope_id = data.get('scope_id')  # global 时可为空
+    if scope_type == 'global':
+        thread, replayed = reading.create_topic(data, user)
+        status = 200 if replayed else 201
+        return jsonify(code=status, message='created', data=reading.thread_data(thread, user)), status
 
     # 校验 scope_type（提前：title 校验按 scope 分支，project=留言式无标题）
     valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task', 'project']  # project=项目广场（功能扩展轮 §五）
@@ -417,6 +458,15 @@ def create_thread():
     )
     db.session.add(thread)
     db.session.commit()
+
+    # 每日首帖即时积分（2026-10-15 用户拍板"发完秒入账"）：帖子已落库，
+    # 奖励独立事务尽力而为，失败不影响发帖（当日扫描兜底）
+    try:
+        from services.points import award_daily_post
+        award_daily_post(thread)
+    except Exception:
+        db.session.rollback()
+        current_app.logger.warning('每日首帖奖励触发失败 thread=%s', thread.id, exc_info=True)
 
     return jsonify({
         "code": 201,
@@ -583,6 +633,11 @@ def get_thread(thread_id):
         ))
         db.session.commit()
 
+    if thread.scope_type == 'global':
+        from services.community_discovery import record_read
+        record_read(thread, user)
+        return jsonify(code=200, data=reading.thread_data(thread, user))
+
     return jsonify({
         "code": 200,
         "data": {
@@ -674,6 +729,10 @@ def update_thread(thread_id):
         return jsonify({"code": 403, "message": "无权限编辑"}), 403
 
     data = request.get_json(silent=True) or {}
+    if thread.scope_type == 'global':
+        if not isinstance(data, dict):
+            raise reading.CommunityError('请求参数错误')
+        return jsonify(code=200, message='updated', data=reading.thread_data(reading.update_topic(thread, data), user))
 
     if 'title' in data:
         thread.title = data['title']
@@ -728,6 +787,12 @@ def delete_thread(thread_id):
     if thread.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限删除"}), 403
 
+    if thread.scope_type == 'global' and thread.author_id == user.id:
+        reading.stop_topic(thread)
+        return jsonify(code=200, message='closed', data=reading.thread_data(thread, user))
+
+    if thread.scope_type == 'global':
+        db.session.refresh(thread, with_for_update=True)
     # 软删除
     thread.status = DiscussionThread.STATUS_DELETED
     db.session.commit()
@@ -794,8 +859,10 @@ def hide_thread(thread_id):
     if not can_moderate_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
 
+    if thread.scope_type == 'global':
+        db.session.refresh(thread, with_for_update=True)
     if thread.status == DiscussionThread.STATUS_HIDDEN:
-        thread.status = DiscussionThread.STATUS_NORMAL
+        thread.status = 'closed' if thread.scope_type == 'global' and thread.author_closed_at else DiscussionThread.STATUS_NORMAL
     else:
         thread.status = DiscussionThread.STATUS_HIDDEN
     db.session.commit()
@@ -820,6 +887,8 @@ def essence_thread(thread_id):
     if not can_moderate_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
     thread.is_essence = not thread.is_essence
+    if thread.scope_type == 'global':
+        thread.featured_at = datetime.now() if thread.is_essence else None
     db.session.commit()
     return jsonify({
         "code": 200,
@@ -846,6 +915,10 @@ def lock_thread(thread_id):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
 
     # 切换锁帖状态
+    if thread.scope_type == 'global':
+        db.session.refresh(thread, with_for_update=True)
+        if reading.closed(thread):
+            return jsonify(code=403, message='作者已停止讨论，无法重新开放'), 403
     if thread.status == DiscussionThread.STATUS_LOCKED:
         thread.status = DiscussionThread.STATUS_NORMAL
     else:
@@ -880,6 +953,14 @@ def create_reply(thread_id):
     # 权限检查
     if not can_view_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限查看"}), 403
+
+    if thread.scope_type == 'global':
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise reading.CommunityError('请求参数错误')
+        reply, replayed = reading.create_comment(thread, user, data)
+        status = 200 if replayed else 201
+        return jsonify(code=status, data=reading.reply_data(reply), message='created'), status
 
     # 锁帖状态下不允许回复
     if thread.status == DiscussionThread.STATUS_LOCKED:
@@ -985,6 +1066,9 @@ def list_replies(thread_id):
     if not can_view_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限查看"}), 403
 
+    if thread.scope_type == 'global':
+        return jsonify(reading.list_comments(thread, request.args, user))
+
     # 分页参数
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
@@ -1077,6 +1161,16 @@ def update_reply(reply_id):
     if reply.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限编辑"}), 403
 
+    if reply.thread.scope_type == 'global':
+        if not can_view_thread(reply.thread, user) or reply.status != 'normal':
+            return jsonify(code=403, message='该回复不可编辑'), 403
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise reading.CommunityError('请求参数错误')
+        reply.content = reading.text_value(data.get('content'), '回复', 2)
+        db.session.commit()
+        return jsonify(code=200, data=reading.reply_data(reply), message='updated')
+
     data = request.get_json(silent=True) or {}
     if 'content' in data:
         reply.content = data['content']
@@ -1111,6 +1205,13 @@ def delete_reply(reply_id):
     if reply.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限删除"}), 403
 
+    if reply.thread.scope_type == 'global':
+        if not can_view_thread(reply.thread, user):
+            return jsonify(code=403, message='无权限查看'), 403
+        db.session.refresh(reply.thread, with_for_update=True)
+        db.session.refresh(reply, with_for_update=True)
+        if reply.status == DiscussionReply.STATUS_DELETED:
+            return jsonify(code=200, message='deleted')
     # 软删除
     reply.status = DiscussionReply.STATUS_DELETED
 
@@ -1161,6 +1262,8 @@ def toggle_reaction():
         target = DiscussionReply.query.get(target_id)
         if not target:
             return jsonify({"code": 404, "message": "回复不存在"}), 404
+        if target.thread.scope_type == 'global' and (target.status != 'normal' or not can_view_thread(target.thread, user)):
+            return jsonify(code=403, message='无权限'), 403
 
     # 检查是否已点赞
     existing = DiscussionReaction.query.filter_by(
@@ -1297,6 +1400,9 @@ def my_article_favorites():
             version = 1
         if not article:
             continue
+        # v2 文章已下架/待审时不对外泄露标题与简介（先审后发 2026-10-15）
+        if version == 2 and article.status != ArticleV2Model.STATUS_PUBLISHED:
+            continue
         result.append({
             "article_id": article.id,
             "article_version": version,
@@ -1325,7 +1431,10 @@ def upload_image():
     if file.content_length and file.content_length > 10 * 1024 * 1024:
         return jsonify({"code": 400, "message": "图片不能超过 10MB"}), 400
     try:
-        data = imaging.showcase_gallery_bytes(file.stream)
+        raw = file.stream.read(10 * 1024 * 1024 + 1)
+        if len(raw) > 10 * 1024 * 1024:
+            return jsonify(code=400, message='图片不能超过 10MB'), 400
+        data = imaging.showcase_gallery_bytes(io.BytesIO(raw))
     except imaging.ImageError as e:
         return jsonify({"code": 400, "message": f"图片无效：{e}"}), 400
     uid = uuid.uuid4()

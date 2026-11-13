@@ -8,7 +8,7 @@ load_dotenv()
 
 HOSTNAME = os.getenv("DB_HOST", "127.0.0.1")
 PORT = os.getenv("DB_PORT", "3306")
-DATABASE = 'sysu_bme'
+DATABASE = os.getenv("DB_DATABASE", "sysu_bme")
 USERNAME = os.getenv("DB_USERNAME")
 PASSWORD = os.getenv("DB_PASSWORD")
 DB_URI = 'mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8mb4'.format(USERNAME, PASSWORD, HOSTNAME, PORT, DATABASE)
@@ -74,6 +74,8 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 # 总开关默认关闭：关闭时 /points-sso/ticket 返回 503，客户端不解析私钥不连上游。
 # 配置完整性与格式校验统一在 points_center_client.init_points_center(app)（app.py 启动时调用），
 # 此处只做读取。回调地址不设内网默认值，开启前必须显式填写浏览器可达的商城地址。
+# 完成迁移 78 后显式开启；默认不查询奖励表、不运行积分任务。
+POINTS_REWARDS_ENABLED = os.getenv("POINTS_REWARDS_ENABLED", "false").lower() == "true"
 POINTS_CENTER_ENABLED = os.getenv("POINTS_CENTER_ENABLED", "false").lower() == "true"
 POINTS_CENTER_BASE_URL = os.getenv("POINTS_CENTER_BASE_URL", "http://172.25.56.83:18081")
 POINTS_PLATFORM_ID = os.getenv("POINTS_PLATFORM_ID", "")
@@ -186,3 +188,6 @@ if IDENTITY_VERIFY_GATE_DEFAULT not in ("off", "shadow", "enforce"):
     raise RuntimeError(f"IDENTITY_VERIFY_GATE_DEFAULT 取值非法：{IDENTITY_VERIFY_GATE_DEFAULT}")
 IDENTITY_VERIFY_GATES_RAW = os.getenv("IDENTITY_VERIFY_GATES", "")
 VERIFY_GATE_GROUPS = ("appoint", "community", "camp_apply", "camp_submit", "publish")
+
+# 独立项目灰度入口；存量项目写模型另由服务器映射状态控制。
+PROJECT_CORE_ENABLED = os.getenv("PROJECT_CORE_ENABLED", "false").lower() in ("1", "on", "true")

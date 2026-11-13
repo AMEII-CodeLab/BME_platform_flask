@@ -804,6 +804,10 @@ def get_email_captcha():
     if purpose not in ("register", "findpwd"):
         return jsonify({"code": 400,
                         "message": "缺少 purpose 参数（register/findpwd），请刷新页面后重试"}), 400
+    # 找回密码先确认账号存在（2026-11-06 现场修复）：未注册邮箱不发码，
+    # 避免用户收到验证码后在重置步才撞「账号或验证码有误」的死胡同。
+    if purpose == "findpwd" and UserModel.query.filter_by(email=email).first() is None:
+        return jsonify({"code": 404, "message": "该邮箱未注册，请先注册"}), 404
     try:
         captcha = issue_captcha(email, purpose)
     except AuthRejected as exc:
@@ -812,8 +816,13 @@ def get_email_captcha():
             resp.headers["Retry-After"] = "60"
         return resp, status
     try:
-        mail.send(Message(subject="BME卓越工程师在线教育平台",
-                          recipients=[email], body=f"您的验证码是:{captcha}"))
+        # 统一验证码邮件模板（独立验证码展示区），见 services/mail_templates.py
+        from services.mail_templates import render_code_email
+        _label = '注册' if purpose == 'register' else '找回密码'
+        _tpl = render_code_email(captcha, title='BME 平台验证码',
+                                 purpose=f'您正在{_label} BME 平台账号', ttl_minutes=5)
+        mail.send(Message(subject=f'BME 平台{_label}验证码',
+                          recipients=[email], body=_tpl['text'], html=_tpl['html']))
     except Exception:
         # 邮件发送失败：challenge 不算成功（删除登记，用户可立即重发）
         from exts import redis_client as _rc
@@ -832,7 +841,9 @@ def get_email_captcha():
 @audit_log(operation="找回密码", is_login=True)
 def find_password():
     data = request.get_json()
-    email = data['User_Email']
+    # 邮箱去除首尾空白再查库（2026-11-06 现场修复）：移动端输入带尾随空格时
+    # 曾被误判为「账号或验证码有误」（captcha/email 侧本来就会 strip）。
+    email = (data.get('User_Email') or '').strip()
     password = data['Password']
     captcha = data['Captcha']
     user = UserModel.query.filter_by(email=email).first()

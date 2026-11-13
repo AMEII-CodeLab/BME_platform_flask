@@ -117,11 +117,16 @@ app.register_blueprint(llm_bp)
 app.register_blueprint(notification_bp)
 app.register_blueprint(seat_bp)
 app.register_blueprint(attendance_report_bp)
+from blueprints.camp_training import bp as camp_training_bp
+app.register_blueprint(camp_training_bp)
 app.register_blueprint(camp_bp)
 app.register_blueprint(camp_staff_bp)
 app.register_blueprint(camp_announcement_bp)
 app.register_blueprint(camp_ms_bp)
 app.register_blueprint(camp_project_bp)
+app.register_blueprint(project_core_bp)
+from services.projects.legacy import install as install_project_legacy_fence
+install_project_legacy_fence(app)
 app.register_blueprint(camp_delivery_bp)
 app.register_blueprint(camp_material_bp)
 app.register_blueprint(camp_meeting_bp)
@@ -142,6 +147,10 @@ app.register_blueprint(work_files_bp)
 app.register_blueprint(identity_bp)
 app.register_blueprint(admin_identity_bp)
 app.register_blueprint(points_sso_bp)
+from blueprints.workbench_sso import bp as workbench_sso_bp
+app.register_blueprint(workbench_sso_bp)
+from blueprints.points import bp as points_bp
+app.register_blueprint(points_bp)
 
 # 每日出勤报告：幂等创建收件人权限 + 启动定时任务（多 worker 下仅一个生效）
 ensure_recipient_permission(app)
@@ -165,6 +174,10 @@ init_ai_topic_scheduler(app)
 
 # 与原全站封禁检查共用一次用户查询，并增加 /admin/ 路径的角色门禁。
 app.before_request(enforce_request_access)
+from services.camp_groups.maintenance import install as install_camp_maintenance
+install_camp_maintenance(app)
+from services.camp_groups.legacy_boundary import install as install_legacy_group_boundary
+install_legacy_group_boundary(app)
 
 
 @app.route('/')

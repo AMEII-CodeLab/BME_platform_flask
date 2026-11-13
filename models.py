@@ -2,12 +2,18 @@ from datetime import datetime
 
 from pygments.lexer import default
 from sqlalchemy import and_
-from sqlalchemy.dialects.mysql import LONGTEXT, MEDIUMTEXT
+from sqlalchemy.dialects.mysql import LONGTEXT, MEDIUMTEXT, DATETIME
 from sqlalchemy.orm import foreign, remote
+from sqlalchemy.ext.hybrid import hybrid_property
 
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from exts import db
+
+# 独立项目表由单独模块维护，外键在统一metadata中解析。
+from project_models import Project, ProjectChange, ProjectCommand, ProjectMilestone, ProjectCalendarEvent
+from project_models import ProjectCampBinding, ProjectCampParticipant, ProjectLegacyMap, ProjectAssessmentLink
+from project_models import ProjectRecord, ProjectRecordFile, ProjectBindingSnapshot, ProjectReminder
 
 
 class UserModel(db.Model):
@@ -729,12 +735,16 @@ class ArticleV2Model(db.Model):
     与旧 ArticleModel 完全隔离（独立表 article_v2）。backref 用 articles_v2，
     避免与 ArticleModel 的 backref="articles" 在 UserModel 上冲突。
 
-    status：draft（草稿，仅作者本人/管理员可见）/ published（已发布，公开）。
+    status：draft（草稿，仅作者本人/管理员可见）/ pending_review（已提交待审，可见性同
+    草稿）/ published（已发布，公开）。普通用户发布先进 pending_review，由文章管理员
+    审批通过后公开（先审后发，2026-10-15）；文章管理员本人发布（含官方推文）直发。
+    审核通过后作者仍可自由编辑、不重审（用户拍板：审核只是发布门槛）。
     草稿的内容字段允许空；created_at/updated_at 记录创建与最后编辑；
-    publish_time 仅已发布文章有（草稿为 None）。
+    publish_time 仅已发布有（草稿/待审为 None，submitted_at 记录提交送审时间）。
     """
     __tablename__ = 'article_v2'
     STATUS_DRAFT = 'draft'
+    STATUS_PENDING_REVIEW = 'pending_review'
     STATUS_PUBLISHED = 'published'
     # 官方富文本推文（2026-09-20 方案）：正文格式 markdown / html 二选一，与
     # is_official（运营身份）、is_essence（精选）正交。html 仅文章管理员可写，
@@ -756,6 +766,11 @@ class ArticleV2Model(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     publish_time = db.Column(db.DateTime, nullable=True)    # 仅已发布有；草稿为 None
+    # 先审后发留痕：submitted_at 提交送审时间；驳回回草稿保留 reject_reason 供作者查看
+    submitted_at = db.Column(db.DateTime, nullable=True)
+    reviewed_by = db.Column(db.Integer, nullable=True)      # 审批人 user.id
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    reject_reason = db.Column(db.String(512), nullable=True)
     # 外键
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     author = db.relationship(UserModel, backref="articles_v2")
@@ -1586,6 +1601,35 @@ class UserPermissionModel(db.Model):
 
 # ==================== 讨论区模块 ====================
 
+class CommunityTag(db.Model):
+    __tablename__ = 'community_tag'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)
+    description = db.Column(db.String(500), nullable=False, default='')
+    is_reading = db.Column(db.Boolean, nullable=False, default=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    suggested_words = db.Column(db.Integer, nullable=False, default=500)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+
+
+class CommunityBook(db.Model):
+    __tablename__ = 'community_book'
+    id = db.Column(db.Integer, primary_key=True)
+    tag_id = db.Column(db.Integer, db.ForeignKey('community_tag.id'), nullable=False)
+    title = db.Column(db.String(150), nullable=False)
+    normalized_title = db.Column(db.String(150), nullable=False)
+    author = db.Column(db.String(100), nullable=False, default='')
+    __table_args__ = (db.UniqueConstraint('tag_id', 'normalized_title', name='uq_community_book_name'),)
+
+
+class DiscussionThreadTag(db.Model):
+    __tablename__ = 'discussion_thread_tag'
+    thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), primary_key=True)
+    tag_id = db.Column(db.Integer, db.ForeignKey('community_tag.id'), primary_key=True)
+    __table_args__ = (db.Index('ix_thread_tag_tag_thread', 'tag_id', 'thread_id'),)
+
+
 class DiscussionThread(db.Model):
     """讨论主题帖"""
     __tablename__ = 'discussion_thread'
@@ -1596,6 +1640,8 @@ class DiscussionThread(db.Model):
     STATUS_LOCKED = 'locked'
     STATUS_DELETED = 'deleted'
 
+    STATUS_CLOSED = 'closed'
+
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     scope_type = db.Column(db.String(20), nullable=False)  # global/article/course/group/task
     scope_id = db.Column(db.Integer, nullable=True)  # 关联对象ID，global时为空
@@ -1604,8 +1650,12 @@ class DiscussionThread(db.Model):
     images_json = db.Column(db.Text, nullable=True)  # 帖子图集 '/media/discussions/...' URL 数组 ≤4（社区重设计 09-19，global 帖用）
     category = db.Column(db.String(20), nullable=True)   # 话题标签（闲聊/提问/分享/招人；global 帖用，Phase 2 09-20）
     project_id = db.Column(db.Integer, nullable=True, index=True)  # 关联 XLAB 项目（帖子导流项目详情）
+    book_id = db.Column(db.Integer, db.ForeignKey('community_book.id'), nullable=True, index=True)
+    author_closed_at = db.Column(db.DateTime, nullable=True)
+    client_request_id = db.Column(db.String(64), nullable=True)
     pinned_until = db.Column(db.DateTime, nullable=True)  # 置顶过期（到点自动失效；空=不过期）
     is_essence = db.Column(db.Boolean, nullable=False, default=False)  # 精华帖（热度 ×2，Phase 3 质量分层）
+    featured_at = db.Column(db.DateTime, nullable=True)
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
     is_pinned = db.Column(db.Boolean, default=False)
@@ -1620,10 +1670,13 @@ class DiscussionThread(db.Model):
     __table_args__ = (
         db.Index('idx_thread_scope_status', 'scope_type', 'scope_id', 'status', 'last_reply_at'),
         db.Index('idx_thread_author', 'author_id', 'created_at'),
+        db.UniqueConstraint('author_id', 'client_request_id', name='uq_thread_request'),
     )
 
     # 关系
     author = db.relationship('UserModel', backref=db.backref('discussion_threads', lazy='dynamic'))
+    tags = db.relationship('CommunityTag', secondary='discussion_thread_tag', lazy='selectin')
+    book = db.relationship('CommunityBook', lazy='joined')
     replies = db.relationship('DiscussionReply', backref='thread', lazy='dynamic',
                              cascade='all, delete-orphan', order_by='DiscussionReply.created_at')
 
@@ -1639,6 +1692,8 @@ class DiscussionReply(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), nullable=False)
     parent_reply_id = db.Column(db.Integer, db.ForeignKey('discussion_reply.id'), nullable=True)  # 楼中楼
+    root_reply_id = db.Column(db.Integer, nullable=True, index=True)
+    client_request_id = db.Column(db.String(64), nullable=True)
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     content = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
@@ -1650,6 +1705,8 @@ class DiscussionReply(db.Model):
     __table_args__ = (
         db.Index('idx_reply_thread', 'thread_id', 'created_at'),
         db.Index('idx_reply_parent', 'parent_reply_id', 'created_at'),
+        db.Index('ix_reply_root_status_created', 'root_reply_id', 'status', 'created_at', 'id'),
+        db.UniqueConstraint('author_id', 'client_request_id', name='uq_reply_request'),
     )
 
     # 关系
@@ -1726,6 +1783,15 @@ class LLMQuotaRequestModel(db.Model):
     user = db.relationship('UserModel', foreign_keys=[user_id],
                            backref=db.backref('llm_quota_requests', lazy='dynamic'))
     reviewer = db.relationship('UserModel', foreign_keys=[reviewed_by])
+
+
+class CommunityVisit(db.Model):
+    """Recent detail reads, separate from lifetime feed impression counters."""
+    __tablename__ = 'community_visit'
+    thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    last_seen_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    __table_args__ = (db.Index('ix_community_visit_recent', 'last_seen_at', 'thread_id'),)
 
 
 class DiscussionReaction(db.Model):
@@ -1828,6 +1894,9 @@ class CampPolicy(db.Model):
 class CampSession(db.Model):
     """营期：如 2026暑期营 / 2026-1学期营"""
     __tablename__ = 'camp_session'
+    # 内部迁移标记；创建界面仍只有一种培训营，旧营须显式映射后置真。
+    training_groups_ready = db.Column(db.Boolean, nullable=False, default=False, server_default='0')
+    training_migration_paused = db.Column(db.Boolean, nullable=False, default=False, server_default='0')
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     camp_type = db.Column(db.String(20), default='short_term')   # 退役：阶段 1 起停读写，保留列便于回滚，下个大版本删除
@@ -1858,7 +1927,8 @@ class CampSession(db.Model):
 
 class CampMember(db.Model):
     """营期成员（独立于 CourseGroup，隔离安全）。
-    role=student/mentor；team_mentor_id 仅 student 行填，指向其导生。
+    旧营 role=student/mentor；统一营职责来自核心。team_mentor_id 是招生兼容读属性：
+    未切换读历史物理列，已切换从 recruitment_unit_id 推导，不用于教学授权。
     状态化（2026-09-20，migrate_45《通知方案》§3.3）：移除改 status=removed 不物理删除
     ——「谁曾经参加、何时退出、谁操作」可追溯；全部业务查询默认只见 active
     （do_orm_execute 全局过滤，见文末 _camp_member_default_filter；历史视图走
@@ -1868,7 +1938,10 @@ class CampMember(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     role = db.Column(db.String(20), nullable=False, default='student')          # student / mentor
-    team_mentor_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
+    legacy_team_mentor_id = db.Column('team_mentor_id', db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
+    learning_enabled = db.Column(db.Boolean)  # NULL 沿用旧 student 资格
+    attendance_required = db.Column(db.Boolean)  # NULL 沿用旧 student 考勤义务
+    recruitment_unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'))
     joined_at = db.Column(db.DateTime, default=datetime.now)
     status = db.Column(db.String(20), nullable=False, default='active')         # active / removed / exited
     ended_at = db.Column(db.DateTime, nullable=True)
@@ -1880,6 +1953,53 @@ class CampMember(db.Model):
         # D5 参与锚点复合外键的引用目标（migrate_66；id 已 PK 故恒成立，仅为可引用）
         db.UniqueConstraint('id', 'camp_session_id', 'user_id', name='uq_cm_triple'),
     )
+
+
+    @hybrid_property
+    def team_mentor_id(self):
+        from services.camp_groups.training_access import recruitment_mentor
+        return recruitment_mentor(self)
+
+    @team_mentor_id.setter
+    def team_mentor_id(self, value):
+        from services.camp_groups.training_access import enabled
+        from services.groups import GroupError
+        # 未入库对象可初始化空历史列；切换后只允许应用服务修改招生绑定。
+        with db.session.no_autoflush:
+            if self.camp_session_id and enabled(self.camp_session_id) and (self.id is not None or value is not None):
+                raise GroupError('已切换营期请通过招生服务调整归属', machine='RECRUITMENT_WRITE_REQUIRED')
+        self.legacy_team_mentor_id = value
+
+    @team_mentor_id.expression
+    def team_mentor_id(cls):
+        from services.camp_groups.training_access import recruitment_mentor_expression
+        return recruitment_mentor_expression(cls)
+
+    @hybrid_property
+    def is_learner(self):
+        return self.learning_enabled if self.learning_enabled is not None else self.role == 'student'
+
+    @is_learner.expression
+    def is_learner(cls):
+        return db.func.coalesce(cls.learning_enabled, cls.role == 'student')
+
+    @hybrid_property
+    def is_mentor(self):
+        from services.camp_groups.training_access import has_role
+        return has_role(self.camp_session_id, self.user_id, 'mentor')
+
+    @is_mentor.expression
+    def is_mentor(cls):
+        from services.camp_groups.training_access import mentor_expression
+        return mentor_expression(cls)
+
+    @hybrid_property
+    def needs_attendance(self):
+        return self.attendance_required if self.attendance_required is not None else self.role == 'student'
+
+    @needs_attendance.expression
+    def needs_attendance(cls):
+        return db.func.coalesce(cls.attendance_required, cls.role == 'student')
 
 
 class CampMemberEvent(db.Model):
@@ -1985,6 +2105,7 @@ class CampCourseAssignment(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), index=True)
     source_type = db.Column(db.String(20), default='direction')
     source_ref_id = db.Column(db.Integer)          # 见类注释；无稳定引用时 NULL
     status = db.Column(db.String(20), default=STATUS_ACTIVE)
@@ -2138,8 +2259,8 @@ class CampMentorPreference(db.Model):
 
 class CampMentorMatch(db.Model):
     """选导生·配对账本（provenance：哪轮/谁配的）。
-    live 真相是 camp_member.team_mentor_id——写入账本时同步设置；下游（考勤看板/请假
-    审批/团队范围）只读 live 链接，本表仅用于结果展示与追溯。"""
+    未切换营的归属仍在历史 team_mentor_id；已切换营由 recruitment_unit_id 唯一定位招生组。
+    本表记录招生来源，不承担多组教学、请假或课程认证授权。"""
     __tablename__ = 'camp_mentor_match'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -2182,6 +2303,7 @@ class CampChapterCertification(db.Model):
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
     mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)   # 认证导生（留痕）
     certified_at = db.Column(db.DateTime, default=datetime.now)
+    meeting_timings = db.Column(db.JSON)  # 每次布置认证时的截止/材料时间快照；旧数据为空，不回算
     score = db.Column(db.Integer)   # 章节评分 0-100（可空=认证未打分；重复 POST 带 score=改分）
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'student_user_id', 'chapter_id', name='uq_cert_camp_student_chapter'),
@@ -2263,14 +2385,55 @@ class CampUnit(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     unit_type = db.Column(db.String(20), nullable=False, default='project')   # mentor_team / project
-    name = db.Column(db.String(100), nullable=False)
+    legacy_name = db.Column('name', db.String(100), nullable=False)
     status = db.Column(db.String(20), nullable=False, default='active')       # active / paused / terminated
     visibility = db.Column(db.String(20), nullable=False, default='camp')     # camp（营内）/ public（可发布到项目展示平台）
-    owner_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)  # 负责人
+    legacy_owner_user_id = db.Column('owner_user_id', db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('camp_group.id', name='fk_camp_unit_group'))
+    camp_group = db.relationship('CampGroup', foreign_keys=[group_id])
+    project_link = db.relationship('ProjectLegacyMap',foreign_keys='ProjectLegacyMap.unit_id',uselist=False,lazy='joined')
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'unit_type', 'name', name='uq_unit_camp_type_name'),
+        db.UniqueConstraint('group_id', name='uq_camp_unit_group'),
     )
+
+    @hybrid_property
+    def name(self):
+        if self.id:
+            row=self.project_link
+            if row and row.write_model=='project':return row.project.title
+        return self.camp_group.name if self.group_id else self.legacy_name
+
+    @name.setter
+    def name(self, value):
+        if self.group_id:
+            raise ValueError('已绑定小组的名称须通过组织服务修改')
+        self.legacy_name = value
+
+    @name.expression
+    def name(cls):
+        return db.func.coalesce(db.select(Project.title).join(ProjectLegacyMap,ProjectLegacyMap.project_id==Project.id).where(ProjectLegacyMap.unit_id==cls.id,ProjectLegacyMap.write_model=='project').scalar_subquery(),db.select(CampGroup.name).where(
+            CampGroup.id == cls.group_id).scalar_subquery(), cls.legacy_name)
+
+    @hybrid_property
+    def owner_user_id(self):
+        if self.id:
+            row=self.project_link
+            if row and row.write_model=='project':return row.binding.leader_user_id
+        return self.camp_group.owner_user_id if self.group_id else self.legacy_owner_user_id
+
+    @owner_user_id.setter
+    def owner_user_id(self, value):
+        if self.group_id:
+            raise ValueError('已绑定小组的负责人须通过组织服务转交')
+        self.legacy_owner_user_id = value
+
+    @owner_user_id.expression
+    def owner_user_id(cls):
+        return db.func.coalesce(db.select(ProjectCampBinding.leader_user_id).join(ProjectLegacyMap,ProjectLegacyMap.binding_id==ProjectCampBinding.id).where(
+            ProjectLegacyMap.unit_id==cls.id,ProjectLegacyMap.write_model=='project').scalar_subquery(),db.select(CampGroup.owner_user_id).where(
+            CampGroup.id == cls.group_id).scalar_subquery(), cls.legacy_owner_user_id)
 
 
 class ProjectProfile(db.Model):
@@ -2461,9 +2624,8 @@ class CampMilestone(db.Model):
 
 
 class CampSubmissionVersion(db.Model):
-    """版本化提交：退回重提=新版本（旧版 superseded）。member 模式每人一条版本链
-    （负责人自己份额交老师审——防自审红线），team 模式一条链（负责人交老师审）。
-    09-13 起前端入口下线（节点评价制替代），表与端点保留待文件提交管理上线复用。"""
+    """版本化提交：每人独立版本链。多人成员交付并由负责人评价，
+    单人项目负责人交付并由管理员验收。重提保存新版本，禁止自审。"""
     __tablename__ = 'camp_submission_version'
     id = db.Column(db.Integer, primary_key=True)
     milestone_id = db.Column(db.Integer, db.ForeignKey('camp_milestone.id'), nullable=False, index=True)
@@ -2482,10 +2644,10 @@ class CampSubmissionVersion(db.Model):
 
 class CampNodeEvaluation(db.Model):
     """项目营·节点评价（2026-09-13，migrate_29）：负责人对每位成员在各交付节点的
-    分数（0-100）+ 评语。评价制交付（文件提交入口本轮下线，老师验收退出）：
+    分数（0-100）+ 评语。多人项目的完成依据：
     - 评价对象 = active 单元成员中除负责人本人（无自评）
     - 可见性：成员仅见本人评价；负责人/admin 见全部
-    - 节点完成态读时派生（评齐=完成），不落 milestone.status
+    - 节点完成态读时按当前成员派生，写评价时同步 milestone.status
     - upsert 语义：重复 PUT 即改分改评（leader_user_id 留痕更新）"""
     __tablename__ = 'camp_node_evaluation'
     id = db.Column(db.Integer, primary_key=True)
@@ -2608,7 +2770,7 @@ class CampMeetingChapterPlan(db.Model):
                            nullable=False, index=True)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)   # 冗余（矩阵列分组用）
     chapter_id = db.Column(db.Integer, db.ForeignKey('chapter.id'), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime().with_variant(DATETIME(fsp=6), 'mysql'), default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('meeting_id', 'chapter_id', name='uq_cmtplan_chapter'),
     )
@@ -2630,7 +2792,7 @@ class CampMeetingTask(db.Model):
     required = db.Column(db.Boolean, default=True)        # 必交（逾期判定与提醒只看必交任务）
     allow_late = db.Column(db.Boolean, default=True)      # 允许迟交（关=逾期后拒收）
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime().with_variant(DATETIME(fsp=6), 'mysql'), default=datetime.now)
 
 
 class CampMeetingTaskSubmission(db.Model):
@@ -2687,6 +2849,7 @@ class ShowcaseProject(db.Model):
     cover = db.Column(db.String(255))                            # 封面（可空，无图用色块兜底）
     images_json = db.Column(db.Text)                             # JSON 图集相对 URL 数组（≤9，走 /projects/<id>/images 专端点）
     tags = db.Column(db.Text)                                    # JSON 字符串数组
+    track = db.Column(db.String(30), nullable=False, default='other')  # 项目场景：大创/比赛/实验室/课程/个人探索/其他
     project_status = db.Column(db.String(20), nullable=False, default='ongoing')  # idea/ongoing/done
     status = db.Column(db.String(20), nullable=False, default='visible')          # visible/hidden（治理）
     members_json = db.Column(db.Text)                            # JSON 展示成员（community 可选公开）
@@ -2795,13 +2958,20 @@ class ClubOfficer(db.Model):
     group_id = db.Column(db.Integer, db.ForeignKey('club_group.id'), nullable=True, index=True)
     title = db.Column(db.String(30), nullable=False)              # 冗余：职位名（双写过渡）
     department = db.Column(db.String(50))                         # 冗余：组名（双写过渡；空=不挂组）
-    term_start = db.Column(db.Date, nullable=False)               # 任期起
+    term_start = db.Column(db.Date)                               # 历史补录允许日期不详；在任必填
     term_end = db.Column(db.Date)                                 # 任期止（空 = 在任）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)  # active / ended
     appointed_by = db.Column(db.Integer)                          # 任命操作人（审计留痕，非 FK）
     ended_by = db.Column(db.Integer)                              # 卸任操作人
     end_reason = db.Column(db.String(200))                        # 卸任原因（选填）
     scope_note = db.Column(db.String(200))                        # 任职范围描述（选填；个人主页社团身份卡展示）
+    person_id = db.Column(db.Integer, index=True)                 # 任职时的人员身份，不随账号改写
+    org_slot_snapshot = db.Column(db.String(10))
+    record_source = db.Column(db.String(20), nullable=False, default='system', server_default='legacy')
+    source_note = db.Column(db.String(500))                       # 历史资料来源
+    historical_year = db.Column(db.Integer)                      # 仅知道年份时保留年份，不伪造日期
+    appointed_at = db.Column(db.DateTime)                        # 登记任命的时间，不等同生效日
+    ended_at = db.Column(db.DateTime)                            # 登记卸任的时间，不等同生效日
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -3421,3 +3591,42 @@ class WorkBusinessLink(db.Model):
         db.UniqueConstraint('item_id', 'source_type', 'source_id',
                             name='uq_work_business_link_unique'),
     )
+
+
+# 教学与项目共用小组核心：拆文件维护，由本入口注册 metadata（迁移 72）。
+from group_models import (CampGroup, GroupMembership, GroupRoleAssignment,
+                          GroupMembershipEvent, GroupOperation,
+                          LegacyUnitMembershipMap)  # noqa: E402,F401
+
+from training_models import TrainingGroupProfile, CampTeachingEvent, TrainingMigrationRun, CampMaintenanceFence
+
+
+# 已映射旧实体只作档案；防止新调用方绕过应用服务继续 ORM 写旧名单。
+def _guard_bound_legacy_member(_mapper, connection, target):
+    from sqlalchemy import inspect, select
+    from services.groups import GroupError
+    ids = {target.unit_id} | set(inspect(target).attrs.unit_id.history.deleted)
+    bound = connection.execute(select(CampUnit.__table__.c.id).where(
+        CampUnit.__table__.c.id.in_(ids), CampUnit.__table__.c.group_id.is_not(None))).first()
+    if bound:
+        raise GroupError('已映射项目的旧名单只读，请通过项目小组服务变更', machine='LEGACY_MEMBERSHIP_READ_ONLY')
+
+
+def _guard_training_legacy_projection(_mapper, connection, target):
+    from sqlalchemy import inspect, select
+    from services.groups import GroupError
+    state = inspect(target).attrs.legacy_team_mentor_id.history
+    if not state.has_changes() or (not state.deleted and target.legacy_team_mentor_id is None):
+        return
+    table = CampSession.__table__
+    ready = connection.execute(select(table.c.id).where(table.c.id == target.camp_session_id,
+        table.c.category == 'learning', table.c.training_groups_ready.is_(True))).first()
+    if ready:
+        raise GroupError('已切换营期的旧招生列只读，请通过招生服务变更', machine='RECRUITMENT_WRITE_REQUIRED')
+
+
+from sqlalchemy import event as _legacy_boundary_event
+for _name in ('before_insert', 'before_update', 'before_delete'):
+    _legacy_boundary_event.listen(CampUnitMember, _name, _guard_bound_legacy_member)
+for _name in ('before_insert', 'before_update'):
+    _legacy_boundary_event.listen(CampMember, _name, _guard_training_legacy_projection)

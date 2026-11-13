@@ -17,6 +17,8 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
+from cryptography.fernet import Fernet
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -86,6 +88,9 @@ class LinkingTestBase(unittest.TestCase):
     """脚手架：SQLite（外键+savepoint）+ Redis 桩 + A/B 双账号人员 + A 会话。"""
 
     def setUp(self):
+        mfa_config = patch('config.MFA_ENC_SECRET', Fernet.generate_key().decode())
+        mfa_config.start()
+        self.addCleanup(mfa_config.stop)
         self.app = Flask(__name__)
         self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
         self.app.config['JWT_SECRET_KEY'] = 'test-secret-key-with-at-least-32-characters'

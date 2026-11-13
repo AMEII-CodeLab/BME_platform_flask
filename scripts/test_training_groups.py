@@ -12,6 +12,7 @@ def sqlite_longtext(_type, _compiler, **_kw):
 
 import test_group_core as foundation
 from exts import db
+from project_models import PROJECT_CORE_TABLES
 from models import (CampSession, CampMember, TrainingGroupProfile, CampTeachingEvent, CampMentorProfile,
     CampCourseAssignment, CourseModel, Chapter, CampChapterCertification, CampChapterMaterial,
     CampLearningProgress, CampLeave, CampAttendancePlan, CampMentorMatch, CampMentorPreference,
@@ -41,6 +42,9 @@ class TrainingSmoke(unittest.TestCase):
                       CampMentorPreference, CampMentorFavorite, CampStaff, CampMemberEvent,
                       CampPersonParticipationModel, AuditLog, NotificationModel, UserCourseModel, CampChapterMaterialAttachment, LearningProgressModel, CampMeeting, CampMeetingAttachment, CampMeetingTask, CampMeetingTaskSubmission, CampMeetingChapterPlan, CampMeetingTaskAttachment):
             include(model.__table__)
+        # CampUnit eagerly joins project mappings, which are not foreign-key dependencies.
+        for table in PROJECT_CORE_TABLES:
+            include(table)
         db.metadata.create_all(db.engine, tables=list(tables))
         self.course = CourseModel(title='C 语言', introduction='fixture', creator_id=self.actor.id)
         db.session.add(self.course)

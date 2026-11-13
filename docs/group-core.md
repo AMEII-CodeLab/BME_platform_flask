@@ -404,3 +404,19 @@ MySQL 共享非阻塞锁显式使用 `FOR SHARE NOWAIT`。已有历史时间和�
 前端两端培训组界面使用 DewUI，现有大一未切换营保留导生提示和原流程。旧 API/物理列
 仍按退役清单保留，跨营进度继承仍未启用。此次没有触碰生产数据库，也没有执行生产名单切换。
 部署与回退流程见 [营期小组上线指南](deploy/营期小组上线指南-202610.md)。
+
+## 导生筛选与组会日期文件夹（2026-11-14）
+
+老师工作台读取 `GET /camp/sessions/<sid>/meetings/all`。仅本营负责人或平台管理员可读；`mentor_id` 必须属于本营。`mentors` 始终为本营完整可选名单，不从当前页或选中导生反推，供前端按姓名查找后提交 ID。
+
+新版传 `limit`（每次日期数，默认 10，范围 1–50），可同时传 `mentor_id`、`start_date`、`end_date`、`before_date`。日期严格使用 `YYYY-MM-DD`，起止日期包含边界，`before_date` 排除此日；同日组会完整返回，不跨页拆分。
+
+响应新增 `groups: [{date, meetings}]`、`has_more`、`next_before_date`。`total` 为导生、日期范围及状态条件下的总场次，不随“加载更早”的游标变化；无匹配时返回空 `groups`、`has_more=false` 和空游标。原 `meetings` 保留；仅传 `page/page_size` 的旧客户端继续按场次分页。两种分页模式不应混用。
+
+本次修复无新增数据库结构，也没有替代小组、项目和社区等既有迁移。教学和旧营切换的隔离测试夹具需创建 `PROJECT_CORE_TABLES`：`CampUnit` 的 eager 项目映射不是仅靠外键递归即可发现的建表依赖。
+
+真实路由契约检查：在后端虚拟环境运行 `python -m unittest discover -s scripts -p test_camp_meeting_overview.py`，覆盖日期分页、完整导生名单、组合筛选、非法参数、旧分页和权限拒绝。
+
+浏览器联调：运行 `python scripts/serve_meeting_contract_fixture.py`（仅本机 5014、内存 SQLite），在前端另开终端运行 `pnpm --filter @bme/user dev:test`，再运行 `pnpm exec playwright test -c e2e/playwright.mentor-contract.config.ts`。组会和进度请求使用真实 Flask 路由；登录初始化和页面外壳仍使用测试数据，不使用业务库或调度器。
+
+`scripts/test_project_core_mysql.py` 仅显式执行时运行。普通 `unittest discover` 导入不读业务 `.env`、不连接数据库、不改环境变量；实际专项须显式配置 `BME_TEST_MYSQL_URI`，仅允许本机 MySQL，并创建和清理自己的随机临时库。不能以 SQLite 通过替代真实 MySQL 专项。

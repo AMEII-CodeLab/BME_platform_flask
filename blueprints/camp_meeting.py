@@ -26,7 +26,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import date, datetime
 
 from flask import Blueprint, request, jsonify, Response, send_file
 from flask_jwt_extended import jwt_required
@@ -455,7 +455,11 @@ def camp_meetings_all(sid):
     查询层先应用筛选再 count→order(meeting_date desc, id desc 稳定)→offset/limit，
     附件/任务数/章节数只对当前页 meeting ids 聚合；mentors = 本营全部导生的筛选选项
     （全量下发，不从当前页推导——翻页后筛选项不抖动）。项目营复用时 mentor 筛选
-    语义=培训组，前端项目营不展示「导生筛选」。"""
+    语义=培训组，前端项目营不展示「导生筛选」。
+    新版日期文件夹传 limit（日期数，默认10、最多50）、before_date（排除此日）、
+    start_date/end_date（包含边界，YYYY-MM-DD）。返回完整日期 groups、has_more、
+    next_before_date；total 保持为筛选范围内全部场次，不随游标变化。
+    仅传 page/page_size 的旧客户端继续读取 meetings 和原分页字段。"""
     camp, err = _camp_or_404(sid)
     if err:
         return err
@@ -475,7 +479,32 @@ def camp_meetings_all(sid):
     if not 1 <= page_size <= 50:
         return jsonify({"code": 400, "message": "page_size 需在 1-50 之间"}), 400
 
+    date_mode = any(key in request.args for key in ('limit', 'before_date', 'start_date', 'end_date'))
+    dates = {}
+    for key in ('before_date', 'start_date', 'end_date'):
+        raw = request.args.get(key)
+        if not raw:
+            continue
+        try:
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+                raise ValueError
+            dates[key] = date.fromisoformat(raw)
+        except ValueError:
+            return jsonify(code=400, message=f'{key} 需为有效的 YYYY-MM-DD 日期'), 400
+    if dates.get('start_date') and dates.get('end_date') and dates['start_date'] > dates['end_date']:
+        return jsonify(code=400, message='起始日期不能晚于结束日期'), 400
+    try:
+        date_limit = int(request.args.get('limit', 10))
+    except (ValueError, TypeError):
+        return jsonify(code=400, message='limit 需为整数'), 400
+    if not 1 <= date_limit <= 50:
+        return jsonify(code=400, message='limit 需在 1-50 之间'), 400
+
     q = CampMeeting.query.filter_by(camp_session_id=sid)
+    if dates.get('start_date'):
+        q = q.filter(CampMeeting.meeting_date >= dates['start_date'])
+    if dates.get('end_date'):
+        q = q.filter(CampMeeting.meeting_date <= dates['end_date'])
 
     unit_id = request.args.get('unit_id')
     if unit_id:
@@ -511,8 +540,22 @@ def camp_meetings_all(sid):
         q = q.filter(has_minutes if status == 'archived' else ~has_minutes)
 
     total = q.count()
-    rows = (q.order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc())
-            .offset((page - 1) * page_size).limit(page_size).all())
+    has_more = False
+    next_before_date = None
+    if date_mode:
+        day_query = q.with_entities(CampMeeting.meeting_date).distinct()
+        if dates.get('before_date'):
+            day_query = day_query.filter(CampMeeting.meeting_date < dates['before_date'])
+        days = [row[0] for row in day_query.order_by(CampMeeting.meeting_date.desc()).limit(date_limit + 1)]
+        has_more = len(days) > date_limit
+        days = days[:date_limit]
+        next_before_date = days[-1].isoformat() if days and has_more else None
+        # 分页单位为完整日期，不能把同一天的组会拆到不同页。
+        rows = (q.filter(CampMeeting.meeting_date.in_(days))
+                .order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc()).all()) if days else []
+    else:
+        rows = (q.order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc())
+                .offset((page - 1) * page_size).limit(page_size).all())
 
     # 聚合只打当前页 ids（附件/任务数/章节数；total 与页内容无关）
     mids = [m.id for m in rows]
@@ -570,8 +613,15 @@ def camp_meetings_all(sid):
                         "username": m_users.get(m.user_id, str(m.user_id)),
                         "direction": direction})
 
-    return jsonify({"code": 200, "meetings": out, "mentors": mentors,
-                    "total": total, "page": page, "page_size": page_size})
+    result = {"code": 200, "meetings": out, "mentors": mentors,
+              "total": total, "page": page, "page_size": page_size}
+    if date_mode:
+        groups = {}
+        for row, item in zip(rows, out):
+            groups.setdefault(row.meeting_date.isoformat(), []).append(item)
+        result.update(groups=[{'date': day, 'meetings': items} for day, items in groups.items()],
+                      has_more=has_more, next_before_date=next_before_date)
+    return jsonify(result)
 
 
 @bp.route("/sessions/<int:sid>/team-meetings", methods=["POST"])

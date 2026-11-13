@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -406,12 +407,13 @@ class ConcurrentProvisionalTest(unittest.TestCase):
     """
 
     def test_concurrent_same_email_single_person(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, ExitStack() as cleanup:
             app = Flask(__name__)
             app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{td}/并发.db'
             app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'connect_args': {'timeout': 15}}
             db.init_app(app)
             with app.app_context():
+                cleanup.callback(db.engine.dispose)
                 db.create_all()
             results = []
             barrier = threading.Barrier(2)

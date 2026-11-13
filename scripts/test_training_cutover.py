@@ -6,6 +6,7 @@ from sqlalchemy import select
 import test_training_groups  # 注册隔离 SQLite 的 LONGTEXT 编译
 import test_group_core as foundation
 from exts import db
+from project_models import PROJECT_CORE_TABLES
 import models as m
 from services.camp_groups import training_migration as migration, maintenance
 from services.groups import GroupError
@@ -26,6 +27,8 @@ class TrainingCutoverSmoke(unittest.TestCase):
                 include(fk.column.table)
         for table in [*migration.snapshot_tables().values(), m.TrainingMigrationRun.__table__,
                       m.TrainingGroupProfile.__table__, m.CampTeachingEvent.__table__]:
+            include(table)
+        for table in PROJECT_CORE_TABLES:
             include(table)
         db.metadata.create_all(db.engine,tables=list(tables))
         self.course = m.CourseModel(title='旧课程',introduction='fixture',creator_id=self.actor.id)

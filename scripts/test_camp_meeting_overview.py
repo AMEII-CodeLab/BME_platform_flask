@@ -8,7 +8,7 @@ from flask_jwt_extended import create_access_token
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.ext.compiler import compiles
 from exts import db
-from models import CampMeeting, CampSession
+from models import CampMeeting, CampSession, CampMember
 import test_training_groups as training_fixtures
 
 
@@ -81,6 +81,29 @@ class MeetingOverviewTest(unittest.TestCase):
                           start_date='2026-11-10', end_date='2026-11-12').json
         self.assertEqual(result['total'], 1)
         self.assertEqual(result['groups'][0]['date'], '2026-11-10')
+
+    def test_roster_marks_current_mentors_and_preserves_historical_records(self):
+        db.session.add(CampMeeting(camp_session_id=self.sid, scope='team',
+            mentor_id=self.fixture.student.id, title='Historical mentor meeting',
+            meeting_date=date(2026, 11, 11), created_by=self.fixture.student.id))
+        db.session.commit()
+        result = self.get(limit=7, start_date='2026-11-09', end_date='2026-11-15').json
+        roster = {row['user_id']: row['is_current'] for row in result['mentors']}
+        self.assertTrue(roster[self.owner_id])
+        self.assertTrue(roster[self.other_id])
+        self.assertFalse(roster[self.fixture.student.id])
+        self.assertFalse(result['has_more'])
+        self.assertEqual(sum(len(group['meetings']) for group in result['groups']), 6)
+
+    def test_current_roster_survives_empty_week_and_excludes_removed_member(self):
+        member = CampMember.query.filter_by(camp_session_id=self.sid, user_id=self.other_id).one()
+        member.status = 'removed'
+        db.session.commit()
+        result = self.get(limit=7, start_date='2026-12-07', end_date='2026-12-13').json
+        self.assertEqual(result['groups'], [])
+        roster = {row['user_id']: row['is_current'] for row in result['mentors']}
+        self.assertTrue(roster[self.owner_id])
+        self.assertFalse(roster[self.other_id])
 
     def test_invalid_cursor_dates_and_limits_are_rejected(self):
         for params in [{'limit': 0}, {'limit': 51}, {'limit': 'x'},

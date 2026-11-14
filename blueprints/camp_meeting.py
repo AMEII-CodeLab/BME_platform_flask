@@ -588,7 +588,7 @@ def camp_meetings_all(sid):
 
     # mentors 筛选选项：本营全部导生（全量、稳定；direction 供前端展示）
     mentor_rows = CampMember.query.filter_by(
-        camp_session_id=sid, is_mentor=True).order_by(CampMember.user_id).all()
+        camp_session_id=sid, status='active', is_mentor=True).order_by(CampMember.user_id).all()
     from types import SimpleNamespace
     known = {row.user_id for row in mentor_rows}
     old_ids = {row.mentor_id for row in CampMeeting.query.filter_by(camp_session_id=sid, scope='team') if row.mentor_id}
@@ -611,7 +611,8 @@ def camp_meetings_all(sid):
                 pass
         mentors.append({"user_id": m.user_id,
                         "username": m_users.get(m.user_id, str(m.user_id)),
-                        "direction": direction})
+                        "direction": direction,
+                        "is_current": m.user_id in known})
 
     result = {"code": 200, "meetings": out, "mentors": mentors,
               "total": total, "page": page, "page_size": page_size}

@@ -409,6 +409,8 @@ MySQL 共享非阻塞锁显式使用 `FOR SHARE NOWAIT`。已有历史时间和�
 
 老师工作台读取 `GET /camp/sessions/<sid>/meetings/all`。仅本营负责人或平台管理员可读；`mentor_id` 必须属于本营。`mentors` 始终为本营完整可选名单，不从当前页或选中导生反推，供前端按姓名查找后提交 ID。
 
+`mentors[].is_current` 表示当前 active 营成员中具有导生职责者，按已有 `CampMember.is_mentor` 兼容旧营及培训组核心。历史组会中的其他导生仍保留在选项中并标记 false。学习营周视图使用周一、周日作为起止日并传 limit=7，取得完整一周；当前名单用于人数分母，历史记录单独标识，未来日期只表示安排。接口没有历史周人员快照。
+
 新版传 `limit`（每次日期数，默认 10，范围 1–50），可同时传 `mentor_id`、`start_date`、`end_date`、`before_date`。日期严格使用 `YYYY-MM-DD`，起止日期包含边界，`before_date` 排除此日；同日组会完整返回，不跨页拆分。
 
 响应新增 `groups: [{date, meetings}]`、`has_more`、`next_before_date`。`total` 为导生、日期范围及状态条件下的总场次，不随“加载更早”的游标变化；无匹配时返回空 `groups`、`has_more=false` 和空游标。原 `meetings` 保留；仅传 `page/page_size` 的旧客户端继续按场次分页。两种分页模式不应混用。
